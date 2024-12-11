@@ -24,7 +24,7 @@ fn csv_parser(
                 .split(delimiter)
                 .enumerate()
                 .map(|(i, s)| {
-                    // Assign default column names if no header name
+                    // assign default column names if no header name
                     if s.is_empty() {
                         format!("col{}", i + 1)
                     } else {
