@@ -81,10 +81,16 @@ fn infer_sql_type(value: &str) -> String {
         return "BIGINT".to_string();
     }
 
-    if let Ok(_parsed_float) = value.parse::<f32>() {
-        return "REAL".to_string();
+    // Check for f32 first to handle numbers that can be accurately represented as f32
+    if let Ok(parsed_float) = value.parse::<f32>() {
+        // Check if the parsed f32 can be converted back to the original string
+        // This ensures that the number can be accurately represented as f32
+        if parsed_float.to_string() == value {
+            return "REAL".to_string();
+        }
     }
 
+    // If f32 check fails or the number cannot be accurately represented as f32, check for f64
     if let Ok(_parsed_float) = value.parse::<f64>() {
         return "FLOAT".to_string();
     }
@@ -143,7 +149,6 @@ mod file_reader {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,8 +164,8 @@ mod tests {
         assert_eq!(infer_sql_type("32767"), "SMALLINT");
         assert_eq!(infer_sql_type("2147483647"), "INT");
         assert_eq!(infer_sql_type("9223372036854775807"), "BIGINT");
-        assert_eq!(infer_sql_type("123.45"), "REAL");
-        assert_eq!(infer_sql_type("123.456789"), "FLOAT");
+        assert_eq!(infer_sql_type("-123.45"), "REAL");
+        assert_eq!(infer_sql_type("123453345334523455555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555554534534534545343.4567345645645645643333333333333333334234234234234234234234234233564564564564589"), "FLOAT");
         assert_eq!(infer_sql_type("2023-10-05"), "DATE");
         assert_eq!(infer_sql_type("2023-10-05 14:30:00"), "DATETIME");
         assert_eq!(infer_sql_type("14:30:00"), "TIME");
