@@ -5,7 +5,16 @@ use uuid::Uuid;
 mod generate_csv;
 
 fn main() -> std::io::Result<()> {
-    csv_parser("test2.csv", ",", true)
+    let filename = "big_csv.csv";
+    let num_rows = 1_000_000;
+
+    // Generate the CSV file
+    generate_csv::generate_csv(filename, num_rows)?;
+
+    // Parse the CSV file
+    csv_parser(filename, ",", true)?;
+
+    Ok(())
 }
 
 fn csv_parser(
@@ -17,6 +26,8 @@ fn csv_parser(
     let mut buffer = String::new();
     let mut headers: Vec<String> = Vec::new();
     let mut column_types: HashMap<String, String> = HashMap::new();
+    let mut column_lengths: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut column_non_ascii: HashMap<String, bool> = HashMap::new();
 
     if has_header {
         if let Some(header_line) = reader.read_line(&mut buffer)? {
@@ -48,11 +59,49 @@ fn csv_parser(
 
             let inferred_type = infer_sql_type(field);
             column_types.entry(column_name.clone()).or_insert_with(|| inferred_type.clone());
+
+            // Track lengths of fields for each column
+            column_lengths
+                .entry(column_name.clone())
+                .or_insert_with(Vec::new)
+                .push(field.len());
+
+            // Track if the column contains non-ASCII characters
+            if !field.is_ascii() {
+                column_non_ascii.insert(column_name.clone(), true);
+            }
+
             if column_types.get(&column_name) != Some(&inferred_type) {
                 column_types.insert(column_name.clone(), "NVARCHAR(MAX)".to_string());
             }
 
-            println!("{}: {} is inferred as {}", column_name, field, inferred_type);
+            // println!("{}: {} is inferred as {}", column_name, field, inferred_type);
+        }
+    }
+
+    // Determine final column types based on lengths and ASCII content
+    for (column_name, lengths) in column_lengths {
+        if let Some(column_type) = column_types.get_mut(&column_name) {
+            if *column_type == "NVARCHAR(MAX)" {
+                continue;
+            }
+
+            let is_uniform_length = lengths.windows(2).all(|w| w[0] == w[1]);
+            let contains_non_ascii = column_non_ascii.get(&column_name).cloned().unwrap_or(false);
+
+            if contains_non_ascii {
+                *column_type = if is_uniform_length {
+                    "NCHAR".to_string()
+                } else {
+                    "NVARCHAR(MAX)".to_string()
+                };
+            } else {
+                *column_type = if is_uniform_length {
+                    "CHAR".to_string()
+                } else {
+                    "VARCHAR(MAX)".to_string()
+                };
+            }
         }
     }
 
@@ -179,9 +228,9 @@ mod tests {
         let temp_file = NamedTempFile::new()?;
         let file_path = temp_file.path().to_str().unwrap();
         let mut file = File::create(file_path)?;
-        writeln!(file, "id,name,age,is_active,created_at")?;
-        writeln!(file, "1,Alice,30,true,2023-10-05 14:30:00")?;
-        writeln!(file, "2,Bob,25,false,2023-10-06 15:45:00")?;
+        writeln!(file, "id,name,age,is_active,created_at,created_time,uuid")?;
+        writeln!(file, "1,Alice,30,true,2023-10-05 14:30:00,14:30:00,123e4567-e89b-12d3-a456-426614174000")?;
+        writeln!(file, "2,Bob,25,false,2023-10-06 15:45:00,15:45:00,123e4567-e89b-12d3-a456-426614174001")?;
 
         csv_parser(file_path, ",", true)?;
 
@@ -193,8 +242,8 @@ mod tests {
         let temp_file = NamedTempFile::new()?;
         let file_path = temp_file.path().to_str().unwrap();
         let mut file = File::create(file_path)?;
-        writeln!(file, "1,Alice,30,true,2023-10-05 14:30:00")?;
-        writeln!(file, "2,Bob,25,false,2023-10-06 15:45:00")?;
+        writeln!(file, "1,Alice,30,true,2023-10-05 14:30:00,14:30:00,123e4567-e89b-12d3-a456-426614174000")?;
+        writeln!(file, "2,Bob,25,false,2023-10-06 15:45:00,15:45:00,123e4567-e89b-12d3-a456-426614174001")?;
 
         csv_parser(file_path, ",", false)?;
 

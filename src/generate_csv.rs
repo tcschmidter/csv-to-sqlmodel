@@ -1,47 +1,71 @@
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{NaiveDate, NaiveTime};
 use rand::Rng;
-use uuid::Uuid;
+use rand::distributions::Alphanumeric;
 use std::fs::File;
 use std::io::{self, Write};
+use uuid::Uuid;
 
-pub fn generate_million_row_csv(file_path: &str) -> io::Result<()> {
-    let mut file = File::create(file_path)?;
+pub fn generate_csv(filename: &str, num_rows: usize) -> io::Result<()> {
+    let mut file = File::create(filename)?;
 
-    writeln!(file, "id,name,age,is_active,created_at")?;
+    // Write the header
+    writeln!(file, "id,name,description,age,is_active,created_at,created_time,uuid")?;
 
-    for i in 1..=1_000_000 {
-        let name = generate_random_name();
-        let age = rand::thread_rng().gen_range(18..=99);
-        let is_active = rand::thread_rng().gen_bool(0.5);
-        let created_at = generate_random_datetime();
+    let mut rng = rand::thread_rng();
 
-        writeln!(file, "{},{},{},{},{}", i, name, age, is_active, created_at)?;
+    for i in 0..num_rows {
+        let id = i + 1;
+        let name = generate_random_string(&mut rng, 10); // Random string of length 10
+        let len = rng.gen_range(50..=100);
+        let description = generate_random_string(&mut rng, len);
+        let age = rng.gen_range(18..=65);
+        let is_active = rng.gen_bool(0.5);
+        let created_at = generate_random_datetime(&mut rng)?;
+        let created_time = generate_random_time(&mut rng)?;
+        let uuid = Uuid::new_v4();
+
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{}",
+            id, name, description, age, is_active, created_at, created_time, uuid
+        )?;
     }
 
-    println!("CSV file with 1 million rows generated successfully.");
     Ok(())
 }
 
-fn generate_random_name() -> String {
-    let first_names = vec!["Alice", "Bob", "Charlie", "David", "Eve"];
-    let last_names = vec!["Smith", "Johnson", "Williams", "Brown", "Jones"];
-
-    let first_name = first_names[rand::thread_rng().gen_range(0..first_names.len())];
-    let last_name = last_names[rand::thread_rng().gen_range(0..last_names.len())];
-
-    format!("{} {}", first_name, last_name)
+fn generate_random_string(rng: &mut impl Rng, length: usize) -> String {
+    rng.sample_iter(&Alphanumeric)
+        .take(length)
+        .map(char::from)
+        .collect()
 }
 
-fn generate_random_datetime() -> String {
-    let start = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
-    let end = Utc::now().naive_utc();
-    let duration = end.signed_duration_since(start);
-    let random_days = rand::thread_rng().gen_range(0..duration.num_days());
-    let random_seconds = rand::thread_rng().gen_range(0..86400);
+fn generate_random_datetime(rng: &mut impl Rng) -> io::Result<String> {
+    let start_date = NaiveDate::from_ymd_opt(1980, 1, 1)
+        .ok_or(io::Error::new(io::ErrorKind::Other, "Invalid start date"))?;
+    let end_date = NaiveDate::from_ymd_opt(2023, 10, 1)
+        .ok_or(io::Error::new(io::ErrorKind::Other, "Invalid end date"))?;
+    let days_between = (end_date - start_date).num_days();
 
-    start.checked_add_days(chrono::Days::new(random_days as u64))
-         .unwrap()
-         .checked_add_signed(chrono::Duration::seconds(random_seconds))
-         .unwrap()
-         .to_string()
+    let random_days = rng.gen_range(0..=days_between);
+    let random_date = start_date + chrono::Duration::days(random_days);
+
+    let hours = rng.gen_range(0..24);
+    let minutes = rng.gen_range(0..60);
+    let seconds = rng.gen_range(0..60);
+
+    let random_datetime = random_date.and_hms_opt(hours, minutes, seconds)
+        .ok_or(io::Error::new(io::ErrorKind::Other, "Invalid datetime"))?;
+    Ok(random_datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+fn generate_random_time(rng: &mut impl Rng) -> io::Result<String> {
+    let hours = rng.gen_range(0..24);
+    let minutes = rng.gen_range(0..60);
+    let seconds = rng.gen_range(0..60);
+
+    let random_time = NaiveTime::from_hms_opt(hours, minutes, seconds)
+        .ok_or(io::Error::new(io::ErrorKind::Other, "Invalid time"))?;
+    Ok(random_time.format("%H:%M:%S").to_string())
 }
