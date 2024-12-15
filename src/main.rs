@@ -1,15 +1,19 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use rayon::prelude::*;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use uuid::Uuid;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 
 mod generate_csv;
 
 fn main() -> std::io::Result<()> {
     let filename = "big_csv.csv";
-    let num_rows = 1_000_000;
-
     // Generate the CSV file
-    generate_csv::generate_csv(filename, num_rows)?;
+    
+    // let num_rows = 1_000_000;
+    // generate_csv::generate_csv(filename, num_rows)?;
 
     // Parse the CSV file
     csv_parser(filename, ",", true)?;
@@ -22,17 +26,16 @@ fn csv_parser(
     delimiter: &str,
     has_header: bool,
 ) -> std::io::Result<()> {
-    let mut reader = file_reader::BufReader::open(filename)?;
-    let mut buffer = String::new();
+    let file = File::open(filename)?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines().peekable();
+
     let mut headers: Vec<String> = Vec::new();
-    let mut column_types: HashMap<String, String> = HashMap::new();
-    let mut column_lengths: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut column_non_ascii: HashMap<String, bool> = HashMap::new();
+    let mut columns: Vec<Vec<String>> = Vec::new();
 
     if has_header {
-        if let Some(header_line) = reader.read_line(&mut buffer)? {
-            let header = header_line;
-            headers = header
+        if let Some(Ok(header_line)) = lines.next() {
+            headers = header_line
                 .trim()
                 .split(delimiter)
                 .enumerate()
@@ -45,68 +48,119 @@ fn csv_parser(
                 })
                 .collect();
             println!("Column names: {:?}", headers);
+            columns.resize(headers.len(), Vec::new());
         }
     }
 
-    while let Some(line) = reader.read_line(&mut buffer)? {
-        let line = line;
-        let fields: Vec<&str> = line.trim().split(delimiter).collect();
-        for (i, field) in fields.iter().enumerate() {
-            let column_name = headers
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("col{}", i + 1));
+    const BATCH_SIZE: usize = 1000;
+    let mut batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
 
-            let inferred_type = infer_sql_type(field);
-            column_types.entry(column_name.clone()).or_insert_with(|| inferred_type.clone());
-
-            // Track lengths of fields for each column
-            column_lengths
-                .entry(column_name.clone())
-                .or_insert_with(Vec::new)
-                .push(field.len());
-
-            // Track if the column contains non-ASCII characters
-            if !field.is_ascii() {
-                column_non_ascii.insert(column_name.clone(), true);
-            }
-
-            if column_types.get(&column_name) != Some(&inferred_type) {
-                column_types.insert(column_name.clone(), "NVARCHAR(MAX)".to_string());
-            }
-
-            // println!("{}: {} is inferred as {}", column_name, field, inferred_type);
-        }
-    }
-
-    // Determine final column types based on lengths and ASCII content
-    for (column_name, lengths) in column_lengths {
-        if let Some(column_type) = column_types.get_mut(&column_name) {
-            if *column_type == "NVARCHAR(MAX)" {
-                continue;
-            }
-
-            let is_uniform_length = lengths.windows(2).all(|w| w[0] == w[1]);
-            let contains_non_ascii = column_non_ascii.get(&column_name).cloned().unwrap_or(false);
-
-            if contains_non_ascii {
-                *column_type = if is_uniform_length {
-                    "NCHAR".to_string()
-                } else {
-                    "NVARCHAR(MAX)".to_string()
-                };
+    while lines.peek().is_some() {
+        batch.clear();
+        for _ in 0..BATCH_SIZE {
+            if let Some(Ok(line)) = lines.next() {
+                batch.push(line);
             } else {
-                *column_type = if is_uniform_length {
-                    "CHAR".to_string()
-                } else {
-                    "VARCHAR(MAX)".to_string()
-                };
+                break;
             }
         }
+
+        // Transpose the batch into columns
+        let transposed_batch = transpose_batch(&batch, delimiter, headers.len());
+
+        // Merge the transposed batch into the main columns
+        for (i, col) in transposed_batch.into_iter().enumerate() {
+            columns[i].extend(col);
+        }
+    }
+
+    let mut column_types: HashMap<String, String> = HashMap::new();
+
+    for (i, column) in columns.into_iter().enumerate() {
+        let column_name = headers.get(i).cloned().unwrap_or_else(|| format!("col{}", i + 1));
+        let inferred_type = infer_column_type(column, delimiter);
+        column_types.insert(column_name, inferred_type);
     }
 
     println!("Inferred column types: {:?}", column_types);
     Ok(())
+}
+
+fn transpose_batch(batch: &[String], delimiter: &str, num_columns: usize) -> Vec<Vec<String>> {
+    let mut transposed: Vec<Vec<String>> = vec![Vec::new(); num_columns];
+
+    for line in batch {
+        let fields: Vec<&str> = line.split(delimiter).collect();
+        for (i, field) in fields.iter().enumerate() {
+            transposed[i].push(field.to_string());
+        }
+    }
+
+    transposed
+}
+
+fn infer_column_type(mut column: Vec<String>, delimiter: &str) -> String {
+    const BATCH_SIZE: usize = 1000;
+    let num_batches = (column.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    let batches: Vec<_> = (0..num_batches)
+        .map(|i| {
+            let start = i * BATCH_SIZE;
+            let end = (start + BATCH_SIZE).min(column.len());
+            column[start..end].to_vec()
+        })
+        .collect();
+
+    let types: Vec<_> = batches.par_iter().map(|batch| {
+        let mut local_types: HashMap<String, usize> = HashMap::new();
+
+        for field in batch {
+            let inferred_type = infer_sql_type(field);
+            *local_types.entry(inferred_type).or_insert(0) += 1;
+        }
+
+        local_types
+    }).collect();
+
+    let mut combined_types: HashMap<String, usize> = HashMap::new();
+    for t in types {
+        for (type_name, count) in t {
+            *combined_types.entry(type_name).or_insert(0) += count;
+        }
+    }
+
+    determine_loosest_type(combined_types)
+}
+
+fn determine_loosest_type(types: HashMap<String, usize>) -> String {
+    let mut type_order = vec![
+        ("BIT", 0),
+        ("TINYINT", 1),
+        ("SMALLINT", 2),
+        ("INT", 3),
+        ("BIGINT", 4),
+        ("REAL", 5),
+        ("FLOAT", 6),
+        ("DATE", 7),
+        ("TIME", 8),
+        ("DATETIME", 9),
+        ("DATETIME2", 10),
+        ("UNIQUEIDENTIFIER", 11),
+        ("CHAR", 12),
+        ("VARCHAR(MAX)", 13),
+        ("NCHAR", 14),
+        ("NVARCHAR(MAX)", 15),
+    ];
+
+    type_order.sort_by_key(|&(_, order)| order);
+
+    for &(type_name, _) in &type_order {
+        if types.contains_key(type_name) {
+            return type_name.to_string();
+        }
+    }
+
+    "NVARCHAR(MAX)".to_string()
 }
 
 fn infer_sql_type(value: &str) -> String {
@@ -114,88 +168,57 @@ fn infer_sql_type(value: &str) -> String {
         return "BIT".to_string();
     }
 
-    if let Ok(_parsed_int) = value.parse::<i8>() {
+    if let Ok(_) = value.parse::<i8>() {
         return "TINYINT".to_string();
     }
 
-    if let Ok(_parsed_int) = value.parse::<i16>() {
+    if let Ok(_) = value.parse::<i16>() {
         return "SMALLINT".to_string();
     }
 
-    if let Ok(_parsed_int) = value.parse::<i32>() {
+    if let Ok(_) = value.parse::<i32>() {
         return "INT".to_string();
     }
 
-    if let Ok(_parsed_int) = value.parse::<i64>() {
+    if let Ok(_) = value.parse::<i64>() {
         return "BIGINT".to_string();
     }
 
-    // Check for f32 first to handle numbers that can be accurately represented as f32
     if let Ok(parsed_float) = value.parse::<f32>() {
-        // Check if the parsed f32 can be converted back to the original string
-        // This ensures that the number can be accurately represented as f32
         if parsed_float.to_string() == value {
             return "REAL".to_string();
         }
     }
 
-    // If f32 check fails or the number cannot be accurately represented as f32, check for f64
-    if let Ok(_parsed_float) = value.parse::<f64>() {
+    if let Ok(_) = value.parse::<f64>() {
         return "FLOAT".to_string();
     }
 
-    if let Ok(_parsed_date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+    if let Ok(_) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
         return "DATE".to_string();
     }
 
-    if let Ok(_parsed_datetime) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+    if let Ok(_) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
         return "DATETIME".to_string();
     }
 
-    if let Ok(_parsed_time) = NaiveTime::parse_from_str(value, "%H:%M:%S") {
+    if let Ok(_) = NaiveTime::parse_from_str(value, "%H:%M:%S") {
         return "TIME".to_string();
     }
 
-    if let Ok(_parsed_timestamp) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
+    if let Ok(_) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
         return "DATETIME2".to_string();
     }
 
-    if let Ok(_parsed_uuid) = Uuid::parse_str(value) {
+    if let Ok(_) = Uuid::parse_str(value) {
         return "UNIQUEIDENTIFIER".to_string();
     }
 
-    // Default to NVARCHAR(MAX) if no other type matches
+    if value.chars().all(|c| c.is_ascii()) && value.len() == value.chars().count() {
+        return "CHAR".to_string();
+    }
+
     "NVARCHAR(MAX)".to_string()
-}
-
-mod file_reader {
-    use std::{
-        fs::File,
-        io::{self, prelude::*},
-    };
-
-    pub struct BufReader {
-        reader: io::BufReader<File>,
-    }
-
-    impl BufReader {
-        pub fn open(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-            let file = File::open(path)?;
-            let reader = io::BufReader::new(file);
-
-            Ok(Self { reader })
-        }
-
-        pub fn read_line<'buf>(&mut self, buffer: &'buf mut String) -> io::Result<Option<&'buf str>> {
-            buffer.clear();
-            let bytes_read = self.reader.read_line(buffer)?;
-            if bytes_read == 0 {
-                Ok(None)
-            } else {
-                Ok(Some(buffer.trim_end()))
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -221,6 +244,7 @@ mod tests {
         assert_eq!(infer_sql_type("2023-10-05 14:30:00.123456"), "DATETIME2");
         assert_eq!(infer_sql_type("123e4567-e89b-12d3-a456-426614174000"), "UNIQUEIDENTIFIER");
         assert_eq!(infer_sql_type("some text"), "NVARCHAR(MAX)");
+        assert_eq!(infer_sql_type("abc"), "CHAR");
     }
 
     #[test]
